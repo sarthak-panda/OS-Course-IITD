@@ -1,0 +1,697 @@
+diff --git a/Kbuild b/Kbuild
+index 464b34a08..a0011ee3c 100644
+--- a/Kbuild
++++ b/Kbuild
+@@ -97,3 +97,4 @@ obj-$(CONFIG_SAMPLES)	+= samples/
+ obj-$(CONFIG_NET)	+= net/
+ obj-y			+= virt/
+ obj-y			+= $(ARCH_DRIVERS)
++obj-y			+= hellos/
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608..3e48e7a37 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -372,6 +372,10 @@
+ 448	common	process_mrelease	sys_process_mrelease
+ 449	common	futex_waitv		sys_futex_waitv
+ 450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
++451 common  hellos          sys_hellos
++452 common  register_gang   sys_register_gang
++453 common  exit_gang       sys_exit_gang
++454 common  list            sys_list
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/hellos/Makefile b/hellos/Makefile
+new file mode 100644
+index 000000000..6bff7fc42
+--- /dev/null
++++ b/hellos/Makefile
+@@ -0,0 +1 @@
++obj-y := hellos.o
+\ No newline at end of file
+diff --git a/hellos/hellos.c b/hellos/hellos.c
+new file mode 100644
+index 000000000..86dcce087
+--- /dev/null
++++ b/hellos/hellos.c
+@@ -0,0 +1,221 @@
++#include <linux/kernel.h>
++#include <linux/uaccess.h>
++#include <linux/sched/gang.h>
++#include <linux/syscalls.h>
++#include <linux/sched.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <linux/rcupdate.h>
++#include <linux/errno.h>
++#include <linux/cpumask.h>
++#include <uapi/linux/sched/types.h>
++struct gang_pid {
++    int pid;
++    struct list_head list;
++};
++struct gang_node {
++    int gangid;
++    int num_threads;
++    struct list_head pid_list;
++    struct list_head list;
++};
++static LIST_HEAD(gang_list);
++static DEFINE_SPINLOCK(gang_list_lock);
++static int __exit_gang(int pid);
++static void exec_timer_callback(struct timer_list *t)
++{
++    struct gang_thread *gthd = from_timer(gthd, t, timer);
++    __exit_gang(gthd->pid);
++}
++SYSCALL_DEFINE0(hellos) {
++	printk("I am linux modified[gang scheduling]....\n");
++	return 0;
++}
++SYSCALL_DEFINE3(register_gang, int, pid, int, gangid, int, exec_time) {
++	struct task_struct *p;
++    struct gang_thread *gthd;
++	struct sched_param param = { .sched_priority = 0 };
++	struct gang_node *gnode;
++    struct gang_pid *gpid;
++	bool new_gang = false;
++	int ret = 0;
++    unsigned long flags;
++    int cpu;
++	if (gangid < 0 || exec_time <= 0) return -EINVAL;
++	spin_lock_irqsave(&gang_list_lock,flags);
++    list_for_each_entry(gnode, &gang_list, list) {
++        if (gnode->gangid == gangid)
++            goto found_gang;
++    }
++	gnode = kmalloc(sizeof(*gnode), GFP_KERNEL);
++    if (!gnode) {
++        spin_unlock_irqrestore(&gang_list_lock,flags);
++        return -ENOMEM;
++    }
++    gnode->gangid = gangid;
++    gnode->num_threads = 0;
++    INIT_LIST_HEAD(&gnode->pid_list);
++    list_add(&gnode->list, &gang_list);
++    new_gang = true;
++found_gang:
++    if (gnode->num_threads >= num_online_cpus()) {
++        ret = -EINVAL;
++        if (new_gang) {
++            list_del(&gnode->list);
++            kfree(gnode);
++        }
++        spin_unlock_irqrestore(&gang_list_lock,flags);
++        return ret;
++    }	
++	gpid = kmalloc(sizeof(*gpid), GFP_KERNEL);
++    if (!gpid) {
++        if (new_gang) {
++            list_del(&gnode->list);
++            kfree(gnode);
++        }
++        spin_unlock_irqrestore(&gang_list_lock,flags);
++        return -ENOMEM;
++    }
++    gpid->pid = pid;
++    list_add_tail(&gpid->list, &gnode->pid_list);
++    gnode->num_threads++;
++    spin_unlock_irqrestore(&gang_list_lock,flags);
++	rcu_read_lock();
++	p = find_task_by_vpid(pid);
++	if (!p) {
++        rcu_read_unlock();
++        goto cleanup_pid;
++    }
++	get_task_struct(p);
++	rcu_read_unlock();
++	gthd = kmalloc(sizeof(*gthd), GFP_KERNEL);
++	if (!gthd){
++        ret= -ENOMEM;
++		goto cleanup_task;
++	}
++	gthd->pid = pid;
++	gthd->exec_time = exec_time;
++	gthd->gangid = gangid;
++	gthd->cpu = task_cpu(p);
++    timer_setup(&gthd->timer, exec_timer_callback, 0);
++    mod_timer(&gthd->timer, jiffies + msecs_to_jiffies(exec_time*1000));
++	//ret = do_sched_setscheduler(p->pid, SCHED_GANG, &param);
++	ret = sched_setscheduler(p, SCHED_GANG, &param);
++	if(ret){
++		goto cleanup_gthd;
++	}
++	p->gang_se.gang_thd = gthd;
++    cpu = task_cpu(p);
++    per_cpu(current_gang_id, cpu) = -1;
++    del_timer(&per_cpu(gang_timer, cpu));
++	put_task_struct(p);
++    return 0;
++cleanup_gthd:
++    kfree(gthd);
++cleanup_task:
++    put_task_struct(p);
++cleanup_pid:
++    spin_lock_irqsave(&gang_list_lock,flags);
++    list_del(&gpid->list);
++    kfree(gpid);
++    gnode->num_threads--;
++    if (gnode->num_threads == 0) {
++        list_del(&gnode->list);
++        kfree(gnode);
++    }
++    spin_unlock_irqrestore(&gang_list_lock,flags);
++    return ret;
++}
++static int __exit_gang(int pid){
++    struct task_struct *p;
++	struct gang_node *gnode;
++    struct gang_pid *gpid, *tmp;
++	int found = 0;
++    unsigned long flags;
++    struct gang_thread *gthd;
++    struct sched_param param = { .sched_priority = 0 };
++	rcu_read_lock();
++	p = find_task_by_vpid(pid);
++	if (!p) {
++        rcu_read_unlock();
++        return -ESRCH;
++    }
++	get_task_struct(p);
++	rcu_read_unlock();
++	if (!p->gang_se.gang_thd) {
++        put_task_struct(p);
++        return -EINVAL;
++    }
++
++    // int cpu = task_cpu(p);//moved this logic to register_gang to avoid racing 
++    // per_cpu(current_gang_id, cpu) = -1;
++    // del_timer(&per_cpu(gang_timer, cpu));
++    gthd = p->gang_se.gang_thd;
++    del_timer_sync(&gthd->timer);
++
++	spin_lock_irqsave(&gang_list_lock,flags);
++    list_for_each_entry(gnode, &gang_list, list) {
++        if (gnode->gangid == p->gang_se.gang_thd->gangid) {
++            list_for_each_entry_safe(gpid, tmp, &gnode->pid_list, list) {
++                if (gpid->pid == pid) {
++                    list_del(&gpid->list);
++                    kfree(gpid);
++                    gnode->num_threads--;
++                    found = 1;
++                    break;
++                }
++            }
++            if (gnode->num_threads == 0) {
++                list_del(&gnode->list);
++                kfree(gnode);
++            }
++            break;
++        }
++    }
++    spin_unlock_irqrestore(&gang_list_lock,flags);
++	if (found) {
++        kfree(p->gang_se.gang_thd);
++        p->gang_se.gang_thd = NULL;
++    }
++    sched_setscheduler(p, SCHED_NORMAL, &param);
++	put_task_struct(p);
++	return found ? 0 : -ENOENT;
++}
++SYSCALL_DEFINE1(exit_gang, int, pid){
++	return __exit_gang(pid);
++}
++SYSCALL_DEFINE2(list, int, gangid, int __user*, pids){
++	struct gang_node *gnode;
++    struct gang_pid *gpid;
++    int *tmp = NULL;
++    int i=0;
++    unsigned long flags;
++    tmp = kmalloc_array(num_online_cpus(),sizeof(int),GFP_KERNEL);
++    if(!tmp) return -ENOMEM;
++    spin_lock_irqsave(&gang_list_lock,flags);
++    list_for_each_entry(gnode, &gang_list, list) {
++        if (gnode->gangid == gangid) {
++            list_for_each_entry(gpid, &gnode->pid_list, list) {
++                if (i >= num_online_cpus()) {
++		    spin_unlock_irqrestore(&gang_list_lock,flags);
++		    kfree(tmp);
++                    return -ENOSPC;
++                }
++                tmp[i++] = gpid->pid;
++            }
++            break;
++        }
++    }
++    spin_unlock_irqrestore(&gang_list_lock,flags);
++    if (i == 0){
++        kfree(tmp);
++	return -ENOENT;
++    }
++    if (copy_to_user(pids, tmp, i * sizeof(int))){
++        kfree(tmp);
++        return -EFAULT;
++    }
++    kfree(tmp);
++    return 0;
++}
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 3dc582414..12c36158a 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -130,6 +130,7 @@
+ 	*(__stop_sched_class)			\
+ 	*(__dl_sched_class)			\
+ 	*(__rt_sched_class)			\
++	*(__gang_sched_class)			\
+ 	*(__fair_sched_class)			\
+ 	*(__idle_sched_class)			\
+ 	__sched_class_lowest = .;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ffb6eb55c..64acf27e4 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -37,6 +37,7 @@
+ #include <linux/kcsan.h>
+ #include <linux/rv.h>
+ #include <asm/kmap_size.h>
++#include <linux/sched/gang.h>
+ 
+ /* task_struct member predeclarations (sorted alphabetically): */
+ struct audit_context;
+@@ -580,6 +581,13 @@ struct sched_entity {
+ #endif
+ };
+ 
++struct sched_gang_entity {
++	struct gang_thread *gang_thd;  // Contains gangid
++	struct list_head run_list;
++	struct gang_rq  *gang_rq;
++	unsigned int on_rq;
++};
++
+ struct sched_rt_entity {
+ 	struct list_head		run_list;
+ 	unsigned long			timeout;
+@@ -788,6 +796,7 @@ struct task_struct {
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
+ 	struct sched_dl_entity		dl;
++	struct sched_gang_entity	gang_se;
+ 	const struct sched_class	*sched_class;
+ 
+ #ifdef CONFIG_SCHED_CORE
+diff --git a/include/linux/sched/gang.h b/include/linux/sched/gang.h
+new file mode 100644
+index 000000000..ab3d8c311
+--- /dev/null
++++ b/include/linux/sched/gang.h
+@@ -0,0 +1,16 @@
++#ifndef _LINUX_SCHED_GANG_H
++#define _LINUX_SCHED_GANG_H
++#include <linux/timer.h>
++#include <linux/percpu-defs.h>
++#ifdef __KERNEL__
++    DECLARE_PER_CPU(int, current_gang_id);
++    DECLARE_PER_CPU(struct timer_list, gang_timer);
++#endif
++struct gang_thread {
++    int pid;
++    int exec_time;
++    int cpu;
++    int gangid;
++    struct timer_list timer;
++};
++#endif
+\ No newline at end of file
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index a34b0f9a9..81a634df7 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -309,6 +309,10 @@ static inline void addr_limit_user_check(void)
+  * include the prototypes if CONFIG_ARCH_HAS_SYSCALL_WRAPPER is enabled.
+  */
+ #ifndef CONFIG_ARCH_HAS_SYSCALL_WRAPPER
++asmlinkage long sys_hellos(void);
++asmlinkage int sys_register_gang(int pid, int gangid, int exec_time);
++asmlinkage int sys_exit_gang(int pid);
++asmlinkage int sys_list(int gangid, int __user *pids);
+ asmlinkage long sys_io_setup(unsigned nr_reqs, aio_context_t __user *ctx);
+ asmlinkage long sys_io_destroy(aio_context_t ctx);
+ asmlinkage long sys_io_submit(aio_context_t, long,
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 3bac0a8ce..995842644 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -118,6 +118,7 @@ struct clone_args {
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
++#define SCHED_GANG		7
+ 
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index 976092b7b..30cda67db 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -32,3 +32,4 @@ obj-y += core.o
+ obj-y += fair.o
+ obj-y += build_policy.o
+ obj-y += build_utility.o
++obj-y += gang.o
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 535af9fbe..90c2fa5a8 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4354,6 +4354,11 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->se.cfs_rq			= NULL;
+ #endif
+ 
++	p->gang_se.gang_thd = NULL;
++	//INIT_LIST_HEAD(&p->gang_se.run_list);
++	p->gang_se.on_rq = 0;
++	p->gang_se.gang_rq = NULL;
++
+ #ifdef CONFIG_SCHEDSTATS
+ 	/* Even if schedstat is disabled, there should not be garbage */
+ 	memset(&p->stats, 0, sizeof(p->stats));
+@@ -6848,13 +6853,18 @@ EXPORT_SYMBOL(default_wake_function);
+ 
+ static void __setscheduler_prio(struct task_struct *p, int prio)
+ {
+-	if (dl_prio(prio))
++	if (p->policy == SCHED_GANG) {
++        p->sched_class = &gang_sched_class;
++    } 
++  	else if (dl_prio(prio)){
+ 		p->sched_class = &dl_sched_class;
+-	else if (rt_prio(prio))
++	}
++	else if (rt_prio(prio)){
+ 		p->sched_class = &rt_sched_class;
+-	else
++	}
++	else{
+ 		p->sched_class = &fair_sched_class;
+-
++	}
+ 	p->prio = prio;
+ }
+ 
+@@ -9635,7 +9645,8 @@ void __init sched_init(void)
+ 
+ 	/* Make sure the linker didn't screw up */
+ 	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
+-	       &fair_sched_class != &rt_sched_class + 1 ||
++		   &fair_sched_class != &gang_sched_class + 1 ||
++      	   &gang_sched_class != &rt_sched_class + 1 ||
+ 	       &rt_sched_class   != &dl_sched_class + 1);
+ #ifdef CONFIG_SMP
+ 	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
+@@ -9728,6 +9739,11 @@ void __init sched_init(void)
+ 		init_tg_cfs_entry(&root_task_group, &rq->cfs, NULL, i, NULL);
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
++		/*GANG_SCHED */
++		spin_lock_init(&rq->gang.lock);
++        INIT_LIST_HEAD(&rq->gang.gangs);
++        rq->gang.nr_running = 0;
++
+ 		rq->rt.rt_runtime = def_rt_bandwidth.rt_runtime;
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 		init_tg_rt_entry(&root_task_group, &rq->rt, NULL, i, NULL);
+diff --git a/kernel/sched/gang.c b/kernel/sched/gang.c
+new file mode 100644
+index 000000000..d10a61135
+--- /dev/null
++++ b/kernel/sched/gang.c
+@@ -0,0 +1,192 @@
++#include <linux/init.h>
++#include <linux/sched/gang.h>
++#include <linux/timer.h>
++#include <linux/smp.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <linux/jiffies.h>
++#include <linux/sched.h>
++#include <linux/sched/cputime.h>
++#include "sched.h"
++#define GANG_QUANTA_MS 10
++static int governor_cpu = 0;
++struct gang_ipi_data {
++    int gangid;
++    int quanta;
++};
++DEFINE_PER_CPU(int, current_gang_id);
++DEFINE_PER_CPU(struct timer_list, gang_timer);
++static void gang_ipi_handler(void *info){
++    struct gang_ipi_data *data = info;
++    int cpu = smp_processor_id();
++    per_cpu(current_gang_id, cpu) = data->gangid;
++    resched_curr(cpu_rq(cpu));
++}
++static void gang_timer_fn(struct timer_list *t)
++{
++    int cpu = smp_processor_id();
++    per_cpu(current_gang_id, cpu) = -1;
++    resched_curr(cpu_rq(cpu));
++}
++static void gang_enqueue_task(struct rq *rq, struct task_struct *p, int flags) {
++    struct gang_rq *grq = &rq->gang;
++    struct sched_gang_entity *gse = &p->gang_se;
++    unsigned long irq_flags;
++    // struct gang_thread *gthd = gse->gang_thd;
++    // printk(KERN_INFO "gang_enqueue_task was invoked by %d with gang id %d on the cpu %d\n",
++    //        p->pid, gthd->gangid, rq->cpu);
++    spin_lock_irqsave(&grq->lock,irq_flags);
++    if (!gse->on_rq) {
++        gse->gang_rq = grq;
++        INIT_LIST_HEAD(&gse->run_list);
++        list_add_tail(&gse->run_list, &grq->gangs);
++        gse->on_rq = 1;
++        grq->nr_running++;
++    }
++    spin_unlock_irqrestore(&grq->lock,irq_flags);
++}
++static void gang_dequeue_task(struct rq *rq, struct task_struct *p, int flags) {
++    struct sched_gang_entity *gse = &p->gang_se;
++    struct gang_rq *grq = gse->gang_rq;
++    unsigned long irq_flags;
++    // struct gang_thread *gthd = gse->gang_thd;
++    if (!grq || !gse->on_rq)
++        return;
++    // printk(KERN_INFO "gang_dequeue_task was invoked by %d with gang id %d on the cpu %d\n",
++    //        p->pid, gthd->gangid, rq->cpu);
++    spin_lock_irqsave(&grq->lock,irq_flags);
++    if (gse->on_rq) {
++        list_del_init(&gse->run_list);
++        grq->nr_running--;
++        gse->on_rq = 0;
++    }
++    spin_unlock_irqrestore(&grq->lock,irq_flags);
++}
++static struct task_struct *gang_pick_next_task(struct rq *rq) {
++    struct gang_rq *grq = &rq->gang;
++    struct sched_gang_entity *gse;
++    struct gang_ipi_data *ipi_data;
++    static int last_gang = -1;
++    int current_gang;
++    unsigned long irq_flags;
++    if (rq->cpu == governor_cpu) {
++        struct list_head *pos, *next;
++        bool found = false;
++        // printk(KERN_INFO "gang_pick_next_task : I am governor cpu with rq->cpu as %d and the governor_cpu as %d\n",
++        //    rq->cpu, governor_cpu);
++        spin_lock_irqsave(&grq->lock,irq_flags);
++        list_for_each_safe(pos, next, &grq->gangs) {
++            gse = list_entry(pos, struct sched_gang_entity, run_list);
++            if (gse->gang_thd->gangid > last_gang) {
++                last_gang = gse->gang_thd->gangid;
++                found = true;
++                goto found;
++            }
++        }
++        if (!list_empty(&grq->gangs)) {
++            gse = list_first_entry(&grq->gangs, struct sched_gang_entity, run_list);
++            last_gang = gse->gang_thd->gangid;
++            found = true;
++        }
++found:           
++        if (found) {
++            ipi_data = kmalloc(sizeof(*ipi_data), GFP_ATOMIC);
++            if (!ipi_data) {
++                spin_unlock_irqrestore(&grq->lock,irq_flags);
++                return NULL;
++            }
++            ipi_data->gangid = last_gang;
++            ipi_data->quanta = GANG_QUANTA_MS;//actually not needed
++            per_cpu(current_gang_id, governor_cpu) = last_gang;
++            smp_call_function(gang_ipi_handler, ipi_data, 1);
++            kfree(ipi_data);
++        }
++        spin_unlock_irqrestore(&grq->lock,irq_flags);
++    }
++    current_gang = per_cpu(current_gang_id, rq->cpu);
++
++    if (current_gang == -1) return NULL;
++    // printk(KERN_INFO "gang_pick_next_task : The current gang in per cpu region is %d at the cpu %d\n",
++    //        current_gang, rq->cpu);
++    spin_lock_irqsave(&grq->lock,irq_flags);
++    list_for_each_entry(gse, &grq->gangs, run_list) {
++        if (gse->gang_thd->gangid == current_gang && gse->on_rq) {
++            spin_unlock_irqrestore(&grq->lock,irq_flags);
++            mod_timer(&per_cpu(gang_timer, rq->cpu), jiffies + msecs_to_jiffies(GANG_QUANTA_MS));
++            return container_of(gse, struct task_struct, gang_se);
++        }
++    }
++    spin_unlock_irqrestore(&grq->lock,irq_flags);
++    return NULL;
++}
++static void check_preempt_wakeup_gang(struct rq *rq, struct task_struct *p, int wake_flags)
++{
++    if (p->sched_class < rq->curr->sched_class)
++        resched_curr(rq);
++}
++static void yield_task_gang(struct rq *rq){}
++static bool yield_to_task_gang(struct rq *rq, struct task_struct *p){return false;}
++static void put_prev_task_gang(struct rq *rq, struct task_struct *prev){}
++static void set_next_task_gang(struct rq *rq, struct task_struct *p, bool first){}
++static int balance_gang(struct rq *rq, struct task_struct *prev, struct rq_flags *rf){return 0;}
++static struct task_struct *pick_task_gang(struct rq *rq){return NULL;}
++static int select_task_rq_gang(struct task_struct *p, int prev_cpu, int wake_flags){return task_cpu(p);}
++static void migrate_task_rq_gang(struct task_struct *p, int new_cpu){}
++static void rq_online_gang(struct rq *rq){}
++static void rq_offline_gang(struct rq *rq){}
++static void task_dead_gang(struct task_struct *p){}
++static void task_tick_gang(struct rq *rq, struct task_struct *curr, int queued){}
++static void task_fork_gang(struct task_struct *p){}
++static void prio_changed_gang(struct rq *rq, struct task_struct *p, int oldprio){}
++static void switched_from_gang(struct rq *rq, struct task_struct *p){}
++static void switched_to_gang(struct rq *rq, struct task_struct *p){}
++static unsigned int get_rr_interval_gang(struct rq *rq, struct task_struct *task){return 0;}
++static void update_curr_gang(struct rq *rq){}
++static void task_change_group_gang(struct task_struct *p){}
++DEFINE_SCHED_CLASS(gang) = {
++	.enqueue_task = gang_enqueue_task,
++	.dequeue_task = gang_dequeue_task,
++	.pick_next_task = gang_pick_next_task,
++    .yield_task		= yield_task_gang,
++	.yield_to_task		= yield_to_task_gang,
++	.check_preempt_curr	= check_preempt_wakeup_gang,
++	.put_prev_task		= put_prev_task_gang,
++	.set_next_task          = set_next_task_gang,
++#ifdef CONFIG_SMP
++	.balance		= balance_gang,
++	.pick_task		= pick_task_gang,
++	.select_task_rq		= select_task_rq_gang,
++	.migrate_task_rq	= migrate_task_rq_gang,
++	.rq_online		= rq_online_gang,
++	.rq_offline		= rq_offline_gang,
++	.task_dead		= task_dead_gang,
++	.set_cpus_allowed	= set_cpus_allowed_common,
++#endif
++	.task_tick		= task_tick_gang,
++	.task_fork		= task_fork_gang,
++	.prio_changed		= prio_changed_gang,
++	.switched_from		= switched_from_gang,
++	.switched_to		= switched_to_gang,
++	.get_rr_interval	= get_rr_interval_gang,
++	.update_curr		= update_curr_gang,
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	.task_change_group	= task_change_group_gang,
++#endif
++#ifdef CONFIG_UCLAMP_TASK
++	.uclamp_enabled		= 1,
++#endif
++};
++static int __init gang_sched_init(void)
++{
++    int cpu;
++    for_each_possible_cpu(cpu) {
++	// struct rq* rq =cpu_rq(cpu);
++	// spin_lock_init(&rq->gang.lock);
++	// INIT_LIST_HEAD(&rq->gang.gangs);
++	// rq->gang.nr_running=0;
++        timer_setup(&per_cpu(gang_timer, cpu), gang_timer_fn, 0);
++        per_cpu(current_gang_id, cpu) = -1;
++    }
++    return 0;
++}
++core_initcall(gang_sched_init);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index d6d488e8e..2ee657b66 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -187,6 +187,11 @@ static inline int fair_policy(int policy)
+ 	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
+ }
+ 
++static inline int gang_policy(int policy)
++{
++    return policy == SCHED_GANG;
++}
++
+ static inline int rt_policy(int policy)
+ {
+ 	return policy == SCHED_FIFO || policy == SCHED_RR;
+@@ -199,7 +204,7 @@ static inline int dl_policy(int policy)
+ static inline bool valid_policy(int policy)
+ {
+ 	return idle_policy(policy) || fair_policy(policy) ||
+-		rt_policy(policy) || dl_policy(policy);
++		rt_policy(policy) || dl_policy(policy) || gang_policy(policy);
+ }
+ 
+ static inline int task_has_idle_policy(struct task_struct *p)
+@@ -336,6 +341,7 @@ extern int  dl_cpu_busy(int cpu, struct task_struct *p);
+ 
+ struct cfs_rq;
+ struct rt_rq;
++struct gang_rq;
+ 
+ extern struct list_head task_groups;
+ 
+@@ -654,6 +660,12 @@ static inline int rt_bandwidth_enabled(void)
+ 	return sysctl_sched_rt_runtime >= 0;
+ }
+ 
++struct gang_rq {
++  	struct list_head gangs;       // List of all gang entities on this CPU
++    unsigned int nr_running;      // Count of gang threads on this CPU
++    spinlock_t lock;              // Per-runqueue lock
++};
++
+ /* RT IPI pull logic requires IRQ_WORK */
+ #if defined(CONFIG_IRQ_WORK) && defined(CONFIG_SMP)
+ # define HAVE_RT_PUSH_IPI
+@@ -990,6 +1002,7 @@ struct rq {
+ 	struct cfs_rq		cfs;
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
++	struct gang_rq		gang;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this CPU: */
+@@ -2248,6 +2261,7 @@ extern struct sched_class __sched_class_lowest[];
+ extern const struct sched_class stop_sched_class;
+ extern const struct sched_class dl_sched_class;
+ extern const struct sched_class rt_sched_class;
++extern const struct sched_class gang_sched_class;
+ extern const struct sched_class fair_sched_class;
+ extern const struct sched_class idle_sched_class;
+ 
+diff --git a/tools/include/uapi/linux/sched.h b/tools/include/uapi/linux/sched.h
+index 3bac0a8ce..995842644 100644
+--- a/tools/include/uapi/linux/sched.h
++++ b/tools/include/uapi/linux/sched.h
+@@ -118,6 +118,7 @@ struct clone_args {
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
++#define SCHED_GANG		7
+ 
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
